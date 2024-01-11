@@ -1,0 +1,217 @@
+Backport PG12>= fixes from upstream.
+Commits:
+ - 2be35a64b0143cb8648f44ed4745bfddfeb96e55
+ - 4ee79572296a8b3ca234c9521391bac86a18ec59
+
+Description: 'relhasoids' was dropped in PG12 and that caused issues with predefined queries in odbc.
+
+Resolves: #2061312
+
+--- a/configure.ac	2018-05-19 12:43:56.000000000 +0200
++++ b/configure.ac	2022-03-24 15:45:03.420713295 +0100
+@@ -138,7 +138,7 @@
+ 
+ if test "$with_libpq" != yes; then
+ 	if test -d "$with_libpq"; then
+-		PATH="$PATH:$with_libpq/bin"
++		PATH="$with_libpq/bin:$PATH"
+ 		CPPFLAGS="$CPPFLAGS -I$with_libpq/include -I$with_libpq/include/postgresql/internal"
+ 		LDFLAGS="$LDFLAGS -L$with_libpq/lib"
+ 	else
+--- a/info.c	2018-05-19 12:32:53.000000000 +0200
++++ b/info.c	2022-03-24 15:44:11.294453181 +0100
+@@ -2341,9 +2341,11 @@
+ 		"t.typname, a.attnum, a.attlen, a.atttypmod, a.attnotnull, "
+ 		"c.relhasrules, c.relkind, c.oid, pg_get_expr(d.adbin, d.adrelid), "
+         "case t.typtype when 'd' then t.typbasetype else 0 end, t.typtypmod, "
+-        "c.relhasoids, %s, c.relhassubclass "
++        "%s, %s, c.relhassubclass "
+ 		"from (((pg_catalog.pg_class c "
+-		"inner join pg_catalog.pg_namespace n on n.oid = c.relnamespace", PG_VERSION_GE(conn, 10.0) ? "attidentity" : "''");
++		"inner join pg_catalog.pg_namespace n on n.oid = c.relnamespace",
++            PG_VERSION_GE(conn, 12.0) ? "0" : "c.relhasoids",
++            PG_VERSION_GE(conn, 10.0) ? "attidentity" : "''");
+ 	if (search_by_ids)
+ 		appendPQExpBuffer(&columns_query, " and c.oid = %u", reloid);
+ 	else
+@@ -2857,7 +2859,12 @@
+ 	/*
+ 	 * Create the query to find out if this is a view or not...
+ 	 */
+-	appendPQExpBufferStr(&columns_query, "select c.relhasrules, c.relkind, c.relhasoids");
++	appendPQExpBufferStr(&columns_query, "select c.relhasrules, c.relkind");
++   if (PG_VERSION_LT(conn, 12.0))
++       appendPQExpBufferStr(&columns_query, ", c.relhasoids");
++   else
++       appendPQExpBufferStr(&columns_query, ", 0 as relhasoids");
++
+ 	appendPQExpBufferStr(&columns_query, " from pg_catalog.pg_namespace u,"
+ 					" pg_catalog.pg_class c where "
+ 					"u.oid = c.relnamespace");
+@@ -3243,7 +3250,7 @@
+ 	initPQExpBuffer(&index_query);
+ 	printfPQExpBuffer(&index_query, "select c.relname, i.indkey, i.indisunique"
+ 		", i.indisclustered, a.amname, c.relhasrules, n.nspname"
+-		", c.oid, d.relhasoids, %s"
++                ", c.oid, %s, %s"
+ 		" from pg_catalog.pg_index i, pg_catalog.pg_class c,"
+ 		" pg_catalog.pg_class d, pg_catalog.pg_am a,"
+ 		" pg_catalog.pg_namespace n"
+@@ -3253,7 +3260,8 @@
+ 		" and d.oid = i.indrelid"
+ 		" and i.indexrelid = c.oid"
+ 		" and c.relam = a.oid order by"
+-		, PG_VERSION_GE(conn, 8.3) ? "i.indoption" : "0"
++		, PG_VERSION_LT(conn, 12.0) ? "d.relhasoids" : "0"
++                , PG_VERSION_GE(conn, 8.3) ? "i.indoption" : "0"
+ 		, eq_string, escTableName, eq_string, escSchemaName);
+ 	appendPQExpBufferStr(&index_query, " i.indisprimary desc,");
+ 	appendPQExpBufferStr(&index_query, " i.indisunique, n.nspname, c.relname");
+--- a/parse.c	2022-03-24 15:41:07.544536251 +0100
++++ b/parse.c	2022-03-28 12:10:34.656785167 +0200
+@@ -379,12 +379,22 @@
+ 	}
+ }
+ 
+-static BOOL CheckHasOidsUsingSaved(StatementClass *stmt, TABLE_INFO *ti)
++/*
++ *	Check relhasoids(before PG12), relhssubclass and get some relevant information.
++ */
++BOOL CheckPgClassInfo(StatementClass *stmt)
+ {
+ 	const COL_INFO *coli;
+ 	int	table_info;
++	TABLE_INFO	*ti;
+ 	BOOL	hasoids = FALSE, hassubclass =FALSE, keyFound = FALSE;
+ 
++MYLOG(0, "Entering\n");
++	if (0 != SC_checked_hasoids(stmt))
++		return TRUE;
++	if (!stmt->ti || !stmt->ti[0])
++		return FALSE;
++	ti = stmt->ti[0];
+ 	MYLOG(DETAIL_LOG_LEVEL, "ti->col_info=%p\n", ti->col_info);
+ 	if (TI_checked_hasoids(ti))
+ 		;
+@@ -465,93 +475,6 @@
+ 	return TRUE;
+ }
+ 
+-static BOOL CheckHasOids(StatementClass * stmt)
+-{
+-	QResultClass	*res;
+-	BOOL		hasoids = TRUE, hassubclass =FALSE, foundKey = FALSE;
+-	char		query[512];
+-	ConnectionClass	*conn = SC_get_conn(stmt);
+-	TABLE_INFO	*ti;
+-
+-MYLOG(0, "Entering\n");
+-	if (0 != SC_checked_hasoids(stmt))
+-		return TRUE;
+-	if (!stmt->ti || !stmt->ti[0])
+-		return FALSE;
+-	ti = stmt->ti[0];
+-	if (CheckHasOidsUsingSaved(stmt, ti))
+-		return TRUE;
+-	// no longer come here??
+-	SPRINTF_FIXED(query,
+-			 "select relhasoids, c.oid, relhassubclass from pg_class c, pg_namespace n where relname = '%s' and nspname = '%s' and c.relnamespace = n.oid",
+-			 SAFE_NAME(ti->table_name), SAFE_NAME(ti->schema_name));
+-	res = CC_send_query(conn, query, NULL, READ_ONLY_QUERY, NULL);
+-	if (QR_command_maybe_successful(res))
+-	{
+-		stmt->num_key_fields = PG_NUM_NORMAL_KEYS;
+-		if (1 == QR_get_num_total_tuples(res))
+-		{
+-			const char *value = QR_get_value_backend_text(res, 0, 0);
+-			const char *value2 = QR_get_value_backend_text(res, 0, 2);
+-			if (value && ('f' == *value || '0' == *value))
+-			{
+-				hasoids = FALSE;
+-				TI_set_has_no_oids(ti);
+-			}
+-			else
+-			{
+-				TI_set_hasoids(ti);
+-				foundKey = TRUE;
+-				STR_TO_NAME(ti->bestitem, OID_NAME);
+-				STRX_TO_NAME(ti->bestqual, "\"" OID_NAME "\" = %u");
+-			}
+-			if (value2 && ('f' == *value2 || '0' == *value2))
+-			{
+-				TI_set_has_no_subclass(ti);
+-			}
+-			else
+-			{
+-				hassubclass = TRUE;
+-				TI_set_hassubclass(ti);
+-				STR_TO_NAME(ti->bestitem, TABLEOID_NAME);
+-				STRX_TO_NAME(ti->bestqual, "\"" TABLEOID_NAME "\" = %u");
+-			}
+-			TI_set_hasoids_checked(ti);
+-			ti->table_oid = (OID) strtoul(QR_get_value_backend_text(res, 0, 1), NULL, 10);
+-		}
+-		QR_Destructor(res);
+-		res = NULL;
+-		if (!hasoids && !hassubclass)
+-		{
+-			SPRINTF_FIXED(query, "select a.attname, a.atttypid from pg_index i, pg_attribute a where indrelid=%u and indnatts=1 and indisunique and indexprs is null and indpred is null and i.indrelid = a.attrelid and a.attnum=i.indkey[0] and attnotnull and atttypid in (%d, %d)", ti->table_oid, PG_TYPE_INT4, PG_TYPE_OID);
+-			res = CC_send_query(conn, query, NULL, READ_ONLY_QUERY, NULL);
+-			if (QR_command_maybe_successful(res) && QR_get_num_total_tuples(res) > 0)
+-			{
+-				foundKey = TRUE;
+-				STR_TO_NAME(ti->bestitem, QR_get_value_backend_text(res, 0, 0));
+-				SPRINTF_FIXED(query, "\"%s\" = %%", SAFE_NAME(ti->bestitem));
+-				if (PG_TYPE_INT4 == (OID) QR_get_value_backend_int(res, 0, 1, NULL))
+-					STRCAT_FIXED(query, "d");
+-				else
+-					STRCAT_FIXED(query, "u");
+-				STRX_TO_NAME(ti->bestqual, query);
+-			}
+-			else
+-			{
+-				/* stmt->updatable = FALSE; */
+-				foundKey = TRUE;
+-				stmt->num_key_fields--;
+-			}
+-		}
+-	}
+-	QR_Destructor(res);
+-	SC_set_checked_hasoids(stmt, foundKey);
+-
+-	MYLOG(DETAIL_LOG_LEVEL, "subclass=%d oids=%d bestqual=%s foundKey=%d num_key_fields=%d\n", TI_has_subclass(ti), TI_has_oids(ti), PRINT_NAME(ti->bestqual), foundKey, stmt->num_key_fields);
+-
+-	return TRUE;
+-}
+-
+ static BOOL increaseNtab(StatementClass *stmt, const char *func)
+ {
+ 	TABLE_INFO	**ti = stmt->ti, *wti;
+@@ -1383,7 +1304,7 @@
+ 	if (SC_parsed_status(stmt) != STMT_PARSE_NONE)
+ 	{
+ 		if (check_hasoids)
+-			CheckHasOids(stmt);
++			CheckPgClassInfo(stmt);
+ 		return TRUE;
+ 	}
+ 	nfields = 0;
+@@ -2261,7 +2182,7 @@
+ 	}
+ 
+ 	if (check_hasoids && updatable)
+-		CheckHasOids(stmt);
++		CheckPgClassInfo(stmt);
+ 	SC_set_parse_status(stmt, parse ? STMT_PARSE_COMPLETE : STMT_PARSE_INCOMPLETE);
+ 	for (i = 0; i < (int) irdflds->nfields; i++)
+ 	{
+--- a/statement.h	2018-05-19 12:32:53.000000000 +0200
++++ b/statement.h	2022-03-28 12:11:20.015023357 +0200
+@@ -542,6 +542,7 @@
+ RETCODE		DiscardStatementSvp(StatementClass *self, RETCODE, BOOL errorOnly);
+ 
+ QResultClass *ParseAndDescribeWithLibpq(StatementClass *stmt, const char *plan_name, const char *query_p, Int2 num_params, const char *comment, QResultClass *res);
++BOOL	CheckPgClassInfo(StatementClass *);
+ 
+ /*
+  *	Macros to convert global index <-> relative index in resultset/rowset
